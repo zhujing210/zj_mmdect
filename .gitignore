@@ -123,3 +123,4 @@ pytest.ini
 *dev_scripts
 *github
 *readthedocs.yml
+train_lm.sh
