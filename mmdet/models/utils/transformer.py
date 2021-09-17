@@ -214,6 +214,8 @@ class TransformerEncoderLayer(nn.Module):
         self.norms.append(build_norm_layer(norm_cfg, embed_dims)[1])
         self.norms.append(build_norm_layer(norm_cfg, embed_dims)[1])
 
+        # memory = self.encoder(
+        #     x, pos=pos_embed, attn_mask=None, key_padding_mask=mask)
     def forward(self, x, pos=None, attn_mask=None, key_padding_mask=None):
         """Forward function for `TransformerEncoderLayer`.
 
@@ -318,6 +320,16 @@ class TransformerDecoderLayer(nn.Module):
         for _ in range(3):
             self.norms.append(build_norm_layer(norm_cfg, embed_dims)[1])
 
+#  out_dec = self.decoder(
+#             target,
+#             memory,
+#             memory_pos=pos_embed,
+#             query_pos=query_embed,
+#             memory_attn_mask=None,
+#             target_attn_mask=None,
+#             memory_key_padding_mask=mask,
+#             target_key_padding_mask=None)
+#         out_dec = out_dec.transpose(1, 2)
     def forward(self,
                 x,
                 memory,

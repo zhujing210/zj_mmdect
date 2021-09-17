@@ -2,6 +2,8 @@ import mmcv
 import numpy as np
 import torch
 from torch.nn.modules.utils import _pair
+from math import sqrt as sqrt
+from itertools import product as product
 
 from .builder import ANCHOR_GENERATORS
 
@@ -468,6 +470,125 @@ class SSDAnchorGenerator(AnchorGenerator):
         repr_str += f'{indent_str}basesize_ratio_range='
         repr_str += f'{self.basesize_ratio_range})'
         return repr_str
+
+
+@ANCHOR_GENERATORS.register_module()
+class DgSSDAnchorGeneratorv2(SSDAnchorGenerator):
+    """"
+    improve speed compare to DgSSDAnchorGenerator.
+    """
+    def __init__(self, **cfg):
+        
+        self._cfg_list = ['MIN_SIZES', 'MAX_SIZES', 'ASPECT_RATIOS']
+        self.strides = cfg['strides']
+        self._prior_cfg = {}
+        self._setup(cfg)
+        self.ratios = self._prior_cfg['ASPECT_RATIOS']
+        self.flip = cfg['flip']
+        assert len(self.strides) == len(self.ratios)
+        self.strides = [_pair(stride) for stride in self.strides]
+
+        self.centers = [(stride[0] / 2., stride[1] / 2.)
+                        for stride in self.strides]
+        min_sizes = self._prior_cfg['MIN_SIZES']
+        max_sizes = self._prior_cfg['MAX_SIZES']
+        if max_sizes: assert len(min_sizes) == len(max_sizes) and mmcv.is_list_of(max_sizes, int)
+
+        anchor_ratios = []
+        for k in range(len(self.strides)):
+            anchor_ratio = [1.]
+            for r in self.ratios[k]:
+                if self.flip:
+                    anchor_ratio += [1 / r, r] 
+                else:
+                    anchor_ratio += [r]
+            anchor_ratios.append(torch.Tensor(anchor_ratio))
+        self.base_sizes = min_sizes
+        self.max_sizes = max_sizes
+        self.ratios = anchor_ratios
+        self.center_offset = 0
+        self.base_anchors = self.gen_base_anchors()
+
+    def _setup(self, cfg):
+        num_feat = len(self.strides)
+        for item in self._cfg_list:
+            if item not in cfg:
+                raise Exception("wrong anchor config!")
+            if len(cfg[item]) != num_feat and len(cfg[item]) != 0:
+                raise Exception("config {} length does not match step length!".format(item))
+            self._prior_cfg[item] = cfg[item]
+    
+    def gen_base_anchors(self):
+        """Generate base anchors.
+
+        Returns:
+            list(torch.Tensor): Base anchors of a feature grid in multiple \
+                feature levels.
+        """
+        multi_level_base_anchors = []
+        for i in range(len(self.base_sizes)):
+            if self.max_sizes:
+                base_anchors = self.gen_single_level_base_anchors(
+                    self.base_sizes[i],
+                    self.max_sizes[i],
+                    ratios=self.ratios[i],
+                    center=self.centers[i])
+            else:
+                base_anchors = self.gen_single_level_base_anchors(
+                    self.base_sizes[i],
+                    self.max_sizes,
+                    ratios=self.ratios[i],
+                    center=self.centers[i])
+            multi_level_base_anchors.append(base_anchors)
+        return multi_level_base_anchors
+
+
+    def gen_single_level_base_anchors(self,
+                                      base_sizes,
+                                      max_size,
+                                      ratios,
+                                      center=None):
+        """"
+        Args:
+        base_sizes: list 
+        max_sizes : int
+        ratios: tensor
+        """
+        w = base_sizes[0]
+        h = base_sizes[0]
+        if center is None:
+            x_center = self.center_offset * w
+            y_center = self.center_offset * h
+        else:
+            x_center, y_center = center
+
+        h_ratios = torch.sqrt(ratios)
+        w_ratios = 1 / h_ratios
+        for i in range(len(base_sizes)):
+            ws = base_sizes[i] * w_ratios
+            hs = base_sizes[i] * h_ratios
+            anchor = [
+            x_center - 0.5 * ws, y_center - 0.5 * hs, x_center + 0.5 * ws,
+            y_center + 0.5 * hs]
+            anchor = torch.stack(anchor, dim=-1)
+            if i==0:
+                anchors = anchor
+            else:
+                anchors = torch.cat((anchors, anchor), 0)
+
+        if max_size:
+            ws = sqrt(max_size*h)
+            hs = sqrt(max_size*h)
+            anchor = [x_center - 0.5 * ws, y_center - 0.5 * hs, 
+                      x_center + 0.5 * ws, y_center + 0.5 * hs]
+            anchor = torch.Tensor(anchor)
+            anchor = anchor.unsqueeze(0)
+            base_anchors = torch.cat((anchor, anchors), 0)
+            tmp = base_anchors.shape[0]  
+            base_anchors = base_anchors[[1, 0, *(list(range(2, tmp)))]]
+        else:
+            base_anchors = anchors
+        return base_anchors
 
 
 @ANCHOR_GENERATORS.register_module()

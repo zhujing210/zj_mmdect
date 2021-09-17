@@ -1,9 +1,9 @@
 import copy
 import inspect
+import cv2
 
 import mmcv
 import numpy as np
-from numpy import random
 
 from mmdet.core import PolygonMasks
 from mmdet.core.evaluation.bbox_overlaps import bbox_overlaps
@@ -20,6 +20,15 @@ try:
 except ImportError:
     albumentations = None
     Compose = None
+
+
+def mask_img(img, boxes, fill_color=[104.0, 117.0, 123.0]):
+    if len(img.shape) == 2:
+        fill_color = [0]
+    for box in boxes:
+        xmin, ymin, xmax, ymax = box[0], box[1], box[2], box[3]
+        img[int(ymin):int(ymax), int(xmin):int(xmax)] = np.array(fill_color).astype(img.dtype)
+    return img
 
 
 @PIPELINES.register_module()
@@ -313,6 +322,45 @@ class Resize(object):
         repr_str += f'keep_ratio={self.keep_ratio}, '
         repr_str += f'bbox_clip_border={self.bbox_clip_border})'
         return repr_str
+
+
+@PIPELINES.register_module()
+class DgScale(Resize):
+    """"Scale the input image to a given range while keep ratio"""
+    #NOTE:  just resize the img,do not change the bbox, mask,etc. Should only be used in multiscale training.
+    def __init__(self, scale_factor, backend='cv2', bbox_clip_border=True, override=False, keep_ratio=True):
+        self.scale_factor_range = scale_factor
+        assert isinstance(self.scale_factor_range, tuple)
+        self.backend = backend
+        self.bbox_clip_border = bbox_clip_border
+        self.override = override
+        self.keep_ratio = keep_ratio
+
+    def __call__(self, results):
+        """Call function to resize images, bounding boxes, masks, semantic
+        segmentation map.
+
+        Args:
+            results (dict): Result dict from loading pipeline.
+
+        Returns:
+            dict: Resized results, 'img_shape', 'pad_shape', 'scale_factor', \
+                'keep_ratio' keys are added into result dict.
+        """
+        min_ratio, max_ratio = self.scale_factor_range
+        assert min_ratio <= max_ratio
+        ratio = np.random.random_sample() * (max_ratio - min_ratio) + min_ratio
+        results['scale_factor'] = ratio
+
+        img_shape = results['img'].shape[:2]
+        assert isinstance(ratio, float)
+        results['scale'] = tuple(
+            [int(x * ratio) for x in img_shape][::-1])
+        self._resize_img(results)
+        self._resize_bboxes(results)
+        self._resize_masks(results)
+        self._resize_seg(results)
+        return results
 
 
 @PIPELINES.register_module()
@@ -829,10 +877,12 @@ class PhotoMetricDistortion(object):
     """
 
     def __init__(self,
+                 gray = False,
                  brightness_delta=32,
                  contrast_range=(0.5, 1.5),
                  saturation_range=(0.5, 1.5),
                  hue_delta=18):
+        self.gray = gray
         self.brightness_delta = brightness_delta
         self.contrast_lower, self.contrast_upper = contrast_range
         self.saturation_lower, self.saturation_upper = saturation_range
@@ -856,47 +906,53 @@ class PhotoMetricDistortion(object):
             'PhotoMetricDistortion needs the input image of dtype np.float32,'\
             ' please set "to_float32=True" in "LoadImageFromFile" pipeline'
         # random brightness
-        if random.randint(2):
-            delta = random.uniform(-self.brightness_delta,
+        if np.random.randint(2):
+            delta = np.random.uniform(-self.brightness_delta,
                                    self.brightness_delta)
             img += delta
 
         # mode == 0 --> do random contrast first
         # mode == 1 --> do random contrast last
-        mode = random.randint(2)
-        if mode == 1:
-            if random.randint(2):
-                alpha = random.uniform(self.contrast_lower,
-                                       self.contrast_upper)
+        if not self.gray:
+            mode = np.random.randint(2)
+            if mode == 1:
+                if np.random.randint(2):
+                    alpha = np.random.uniform(self.contrast_lower,
+                                        self.contrast_upper)
+                    img *= alpha
+
+            # convert color from BGR to HSV
+            img = mmcv.bgr2hsv(img)
+
+            # random saturation
+            if np.random.randint(2):
+                img[..., 1] *= np.random.uniform(self.saturation_lower,
+                                            self.saturation_upper)
+
+            # random hue
+            if np.random.randint(2):
+                img[..., 0] += np.random.uniform(-self.hue_delta, self.hue_delta)
+                img[..., 0][img[..., 0] > 360] -= 360
+                img[..., 0][img[..., 0] < 0] += 360
+
+            # convert color from HSV to BGR
+            img = mmcv.hsv2bgr(img)
+
+            # random contrast
+            if mode == 0:
+                if np.random.randint(2):
+                    alpha = np.random.uniform(self.contrast_lower,
+                                        self.contrast_upper)
+                    img *= alpha
+
+            # randomly swap channels
+            if np.random.randint(2):
+                img = img[..., np.random.permutation(3)]
+        else:
+            if np.random.randint(2):
+                alpha = np.random.uniform(self.contrast_lower,
+                                        self.contrast_upper)
                 img *= alpha
-
-        # convert color from BGR to HSV
-        img = mmcv.bgr2hsv(img)
-
-        # random saturation
-        if random.randint(2):
-            img[..., 1] *= random.uniform(self.saturation_lower,
-                                          self.saturation_upper)
-
-        # random hue
-        if random.randint(2):
-            img[..., 0] += random.uniform(-self.hue_delta, self.hue_delta)
-            img[..., 0][img[..., 0] > 360] -= 360
-            img[..., 0][img[..., 0] < 0] += 360
-
-        # convert color from HSV to BGR
-        img = mmcv.hsv2bgr(img)
-
-        # random contrast
-        if mode == 0:
-            if random.randint(2):
-                alpha = random.uniform(self.contrast_lower,
-                                       self.contrast_upper)
-                img *= alpha
-
-        # randomly swap channels
-        if random.randint(2):
-            img = img[..., random.permutation(3)]
 
         results['img'] = img
         return results
@@ -952,7 +1008,7 @@ class Expand(object):
             dict: Result dict with images, bounding boxes expanded
         """
 
-        if random.uniform(0, 1) > self.prob:
+        if np.random.uniform(0, 1) > self.prob:
             return results
 
         if 'img_fields' in results:
@@ -961,7 +1017,7 @@ class Expand(object):
         img = results['img']
 
         h, w, c = img.shape
-        ratio = random.uniform(self.min_ratio, self.max_ratio)
+        ratio = np.random.uniform(self.min_ratio, self.max_ratio)
         # speedup expand when meets large image
         if np.all(self.mean == self.mean[0]):
             expand_img = np.empty((int(h * ratio), int(w * ratio), c),
@@ -971,8 +1027,8 @@ class Expand(object):
             expand_img = np.full((int(h * ratio), int(w * ratio), c),
                                  self.mean,
                                  dtype=img.dtype)
-        left = int(random.uniform(0, w * ratio - w))
-        top = int(random.uniform(0, h * ratio - h))
+        left = int(np.random.uniform(0, w * ratio - w))
+        top = int(np.random.uniform(0, h * ratio - h))
         expand_img[top:top + h, left:left + w] = img
 
         results['img'] = expand_img
@@ -1063,22 +1119,22 @@ class MinIoURandomCrop(object):
         boxes = np.concatenate(boxes, 0)
         h, w, c = img.shape
         while True:
-            mode = random.choice(self.sample_mode)
+            mode = np.random.choice(self.sample_mode)
             self.mode = mode
             if mode == 1:
                 return results
 
             min_iou = mode
             for i in range(50):
-                new_w = random.uniform(self.min_crop_size * w, w)
-                new_h = random.uniform(self.min_crop_size * h, h)
+                new_w = np.random.uniform(self.min_crop_size * w, w)
+                new_h = np.random.uniform(self.min_crop_size * h, h)
 
                 # h / w in [0.5, 2]
                 if new_h / new_w < 0.5 or new_h / new_w > 2:
                     continue
 
-                left = random.uniform(w - new_w)
-                top = random.uniform(h - new_h)
+                left = np.random.uniform(w - new_w)
+                top = np.random.uniform(h - new_h)
 
                 patch = np.array(
                     (int(left), int(top), int(left + new_w), int(top + new_h)))
@@ -1623,15 +1679,15 @@ class RandomCenterCropPad(object):
         h, w, c = img.shape
         boxes = results['gt_bboxes']
         while True:
-            scale = random.choice(self.ratios)
+            scale = np.random.choice(self.ratios)
             new_h = int(self.crop_size[0] * scale)
             new_w = int(self.crop_size[1] * scale)
             h_border = self._get_border(self.border, h)
             w_border = self._get_border(self.border, w)
 
             for i in range(50):
-                center_x = random.randint(low=w_border, high=w - w_border)
-                center_y = random.randint(low=h_border, high=h - h_border)
+                center_x = np.random.randint(low=w_border, high=w - w_border)
+                center_y = np.random.randint(low=h_border, high=h - h_border)
 
                 cropped_img, border, patch = self._crop_image_and_paste(
                     img, [center_y, center_x], [new_h, new_w])
@@ -1809,3 +1865,272 @@ class CutOut(object):
                      else f'cutout_shape={self.candidates}, ')
         repr_str += f'fill_in={self.fill_in})'
         return repr_str
+
+
+@PIPELINES.register_module()
+class Expand2Canvas(object):
+    """"
+    Resize image: keep the long side while keep ratio.
+    If the scaled image is smaller than the desired image size,then expand the scaled image.
+
+    Args:
+        size (list | tuple): desired image size
+        mean (list | tuple): expand the scaled image with mean value if needed
+        use_base
+    """
+
+    def __init__(self, size, mean, use_base=False, bbox_clip_border=True, gray_img=False):
+        self.mean = mean
+        self.size = size
+        self.use_base = use_base
+        self.bbox_clip_border = bbox_clip_border
+        self.gray_img = gray_img
+
+    def __call__(self, results):
+        ch, cw= self.size
+        image = results['img']
+        height, width, depth = image.shape
+        expand_image = np.zeros((ch, cw, depth), dtype=image.dtype)
+
+        ratio = 1.
+        if height > ch or width > cw:
+            ratio = np.min(np.array([ch, cw]).astype(np.float) / np.array([height, width]))
+        height, width = int(height * ratio), int(width * ratio)
+        results['scale_factor'] = ratio
+
+        left = top = 0
+        interpolation = cv2.INTER_LINEAR #cv2.INTER_AREA #
+        if not self.use_base:
+            left = np.random.uniform(0, cw - width)
+            top = np.random.uniform(0, ch - height)
+            interpolation = np.random.choice([cv2.INTER_LINEAR, cv2.INTER_NEAREST, cv2.INTER_AREA])
+            expand_image[:, :, :] = np.array([np.random.randint(0, 255) for _ in range(3)], dtype=image.dtype) #self.mean
+
+        image = cv2.resize(image, (width, height), interpolation=interpolation)
+        expand_image[int(top):int(top + height), int(left):int(left + width)] = image
+        image = expand_image
+        results['img_shape'] = image.shape
+        results['pad_shape'] = image.shape
+
+        for key in results.get('bbox_fields', []):
+            boxes = results[key]
+            boxes *= ratio
+            if not self.use_base:
+                boxes[:, :2] += np.array((int(left), int(top)), dtype=np.float32)
+                boxes[:, 2:] += np.array((int(left), int(top)), dtype=np.float32)
+                #remove small face
+            boxes_area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            #20*20 #18*18
+            small_area = 32 #44.4444 #64 #64 #47.61 #36 #20.25 #72 #90. #64. #81.
+            mask = boxes_area > small_area
+
+            if not mask.all():
+                if not self.gray_img:
+                    fill_color = [np.random.randint(0, 256) for _ in range(3)]
+                else:
+                    color = np.random.randint(0, 256)
+                    fill_color = [color] * 3
+                image = mask_img(image, boxes[mask, :], fill_color=fill_color)
+            boxes = boxes[mask, :]
+
+            if self.bbox_clip_border:
+                img_shape = results['img_shape']
+                boxes[:, 0::2] = np.clip(boxes[:, 0::2], 0, img_shape[1])
+                boxes[:, 1::2] = np.clip(boxes[:, 1::2], 0, img_shape[0])
+            keep = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+            boxes = boxes[keep]
+            results[key] = boxes
+            if key in ['gt_bboxes']:
+                if 'gt_labels' in results:
+                    labels = results['gt_labels'][mask]
+                    labels = labels[keep]
+                    results['gt_labels'] = labels
+        results['img'] = image
+        return results
+
+
+# TODO 两张图片的gt 重合 怎么处理，移图片嘛
+@PIPELINES.register_module()
+class MixUp(object):
+    def __init__(self, classes, least_category, p=0.3, lambd=0.5, use_base=False):
+        self.classes = classes
+        self.least_category_label = self.classes.index(least_category)
+        self.lambd = lambd
+        self.p = p
+        self.imgs = []
+        self.img2 = None
+        self.boxes2 = None
+        self.labels2= None
+        self.use_base = use_base
+
+    def __call__(self, results):
+        if 'img_fields' in results:
+            assert results['img_fields'] == ['img'], \
+                'Only single img_fields is allowed'
+        img1 = results['img']
+        assert 'bbox_fields' in results
+        boxes = [results[key] for key in results['bbox_fields']]
+        boxes1 = np.concatenate(boxes, 0)
+        labels1 = results['gt_labels']
+        left2 = top2 = 0
+        img2 = self.imgs[np.random.randint(0, len(self.imgs))]
+        if np.random.uniform(0, 1) < self.p and img2 is not None and (not (labels1==1).any()):
+            h1, h2 = img1.shape[0], img2.shape[0]
+            w1, w2 = img1.shape[1], img2.shape[1]
+            height = max(h1, h2)
+            width = max(w1, w2)
+            if not self.use_base:
+                left2 = np.random.uniform(0, width - w2)
+                top2 = np.random.uniform(0, height - h2)
+
+            mixup_image = np.zeros([height, width, 3], dtype='float32')
+            mixup_image[:h1, :w1, :] = img1.astype('float32') * self.lambd
+            mixup_image[int(top2):int(top2+h2), int(left2):int(left2+w2), :] += img2.astype('float32') * (1. - self.lambd)
+            mixup_image = mixup_image.astype('uint8')
+            results['img_shape'] = mixup_image.shape
+            results['pad_shape'] = mixup_image.shape
+
+            self.boxes2[:, :2] += np.array((int(left2), int(top2)), dtype=np.float32)
+            self.boxes2[:, 2:] += np.array((int(left2), int(top2)), dtype=np.float32)
+            mixup_boxes = np.vstack((boxes1, self.boxes2))
+            mixup_label = np.hstack((labels1,self.labels2))
+            #print(self.lambd,mixup_boxes,mixup_label)
+            results['img'] = mixup_image
+            results['gt_bboxes'] = mixup_boxes
+            results['gt_labels'] = mixup_label
+        if (labels1 == self.least_category_label).any():
+            self.imgs.append({'img': img1, 'box': boxes1, 'labels': labels1})
+            if len(self.imgs) > 20:
+                self.imgs.pop(-1)
+        return results
+
+
+@PIPELINES.register_module()
+class CopyPaste(object):
+    """ Copy specify category to all imgs.
+    论文题目：Augmentation for small object detection
+    论文链接：https://arxiv.org/abs/1902.07296
+    代码链接：https://github.com/gmayday1997/SmallObjectAugmentation
+    Args:
+        classes (list | tuple): all classes 
+        least_category (str): the category with minimum number of gts
+        paste_num_range (int): select a number from [0, paste_number_range] as num_gts pasted to one img
+        max_num (int): the maximum number of patches saved in memory(list), set this to avoid occupy much memory
+        p (float): the probability to implement this data agumentation
+        iou_thr (flaot): the iou between new paste patch and img'gts should not exceeded this threshold
+        patch_num_range (int): select a number from [0, patch_num_range] to decide a patch's paste time
+    """ 
+    def __init__(self, classes, least_category, paste_num_range=1, 
+                       max_num=100, p=0.1, iou_thr=0, patch_num_range=2):
+        self.p = p
+        self.classes = classes
+        self.least_category_label = self.classes.index(least_category)
+        self.patches = []
+        self.max_num = max_num
+        self.paste_num_range = paste_num_range
+        self.iou_thr = iou_thr
+        self.patch_num_range = patch_num_range
+    
+    def __call__(self, results):
+        if 'img_fields' in results:
+            assert results['img_fields'] == ['img'], \
+                'Only single img_fields is allowed'
+        img1 = results['img']
+        #if img1 is None or img1.shape[0]==0 or img1.shape[1]==0: return results
+        assert 'bbox_fields' in results
+        boxes1 = [results[key] for key in results['bbox_fields']]
+        boxes1 = np.concatenate(boxes1, 0)
+        labels1 = results['gt_labels'] 
+        if (labels1 == self.least_category_label).any():
+            idxes = np.where(labels1==self.least_category_label)[0]
+            if len(self.patches) > self.max_num:
+                self.patches.pop(idxes.shape[0])
+            for idx in idxes:
+                x0, y0, x1, y1 = boxes1[idx]
+                if x1 > x0 and y1 > y0 and x0 > 0 and y0 > 0:
+                    patch = img1[int(y0):int(y1), int(x0):int(x1), :]
+                    self.patches.append(patch)
+        
+        if not self.patches: return results
+        if  np.random.uniform(0, 1)  <= self.p:
+            all_boxes, all_labels, img = self.copysmallobjects2(img1, boxes1, labels1)
+            results['img'] = img
+            results['gt_bboxes'] = all_boxes.astype(np.float32)
+            results['gt_labels'] = all_labels.astype(np.int64)
+        return results
+
+    def copysmallobjects2(self, img, boxes1, labels1):
+        new_labels = np.array([])
+        num_original_boxes = boxes1.shape[0]
+
+        patch_num = min(np.random.randint(1, self.patch_num_range + 1), len(self.patches))
+        if patch_num==0: return  boxes1, labels1 ,img
+        select_patches = np.random.choice(list(range(len(self.patches))), patch_num)
+        for select in select_patches:
+            select_patch = self.patches[select]
+            h_select_patch, w_select_patch, _ =  select_patch.shape
+            # 水平翻转
+            if np.random.uniform(0,1) < 0.5:
+                select_patch = select_patch[:, ::-1, :]
+            # 随机等比例缩放
+            if np.random.uniform(0, 1) < 0.6:
+                scale = np.random.uniform(0.5, 1.5)
+                if h_select_patch <20 or w_select_patch < 20 and scale < 1:
+                    pass
+                elif h_select_patch > 600 or h_select_patch > 600 and scale > 1:
+                    pass
+                else:
+                    select_patch = cv2.resize(select_patch, 
+                                        (int(scale * w_select_patch), int(scale * h_select_patch)))
+                    h_select_patch, w_select_patch, _ =  select_patch.shape
+                
+            if h_select_patch > img.shape[0] or w_select_patch > img.shape[1]:
+                continue
+            new_boxes = self.random_add_patches2(select_patch, boxes1, img.shape)  # 每个patch 对应的所有 bbox
+            if new_boxes.size==0: continue
+            boxes1 = np.vstack((boxes1, new_boxes))
+            # 两张图像融合
+            for new_bbox in new_boxes:
+                x0, y0, x1, y1= new_bbox[0], new_bbox[1], new_bbox[2], new_bbox[3]
+                #patch = GaussianBlurImg(patch)  # 高斯模糊
+                center = (int(w_select_patch / 2), int(h_select_patch / 2))
+                mask = 255 * np.ones(select_patch.shape, np.uint8)
+                # 泊松融合
+                try:
+                    img[y0:y1, x0:x1] = cv2.seamlessClone(select_patch.astype(np.uint8), img[y0:y1, x0:x1].astype(np.uint8),
+                                                                mask, center, cv2.NORMAL_CLONE)
+                except cv2.error:
+                    print("*"*10)
+                    print("Failed to implement copypaste...")
+                    print("\npatch.shape:", select_patch.shape)
+                    print("\nimg[y0:y1, x0:x1].shape, x0, y0, x1, y1:", img[y0:y1, x0:x1].shape, x0, y0, x1, y1)
+                    print("\nmask.shape:", mask.shape)
+                    print("\ncenter:", center)
+                    print("*"*10)
+                    assert 1==0
+
+        img = img.astype(np.float32)
+        num_new_boxes = boxes1.shape[0] - num_original_boxes
+        if num_new_boxes > 0:
+            new_labels = np.ones((num_new_boxes)) * self.least_category_label
+            labels1 = np.hstack((labels1, new_labels))
+        return boxes1, labels1 ,img
+
+    def random_add_patches2(self, patch, all_boxes, img_shape):
+        success_num, try_time = 0, 0
+        h_img, w_img, _ = img_shape 
+        h_patch, w_patch, _ = patch.shape
+        new_boxes = np.array([])
+        paste_num = np.random.randint(1, self.paste_num_range + 1)
+        # paste_num = self.paste_num_range
+        while try_time < 10 and success_num <= paste_num:
+            try_time += 1
+            left, top = np.random.randint(0, w_img-w_patch + 1), np.random.randint(0, h_img - h_patch + 1)
+            new_x0, new_y0, new_x1, new_y1 = left, top, left + w_patch, top + h_patch
+            new_bbox = np.array([int(new_x0), int(new_y0), int(new_x1), int(new_y1)]).reshape((-1,4))
+            ious = bbox_overlaps(new_bbox, all_boxes) 
+            if ious.max() <= self.iou_thr :
+                success_num += 1
+                all_boxes = np.vstack((all_boxes, new_bbox))
+                new_boxes = new_bbox if success_num==1 else np.vstack((new_boxes, new_bbox))
+        return new_boxes

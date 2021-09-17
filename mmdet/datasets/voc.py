@@ -21,12 +21,14 @@ class VOCDataset(XMLDataset):
 
     def __init__(self, **kwargs):
         super(VOCDataset, self).__init__(**kwargs)
+
         if 'VOC2007' in self.img_prefix:
             self.year = 2007
         elif 'VOC2012' in self.img_prefix:
             self.year = 2012
         else:
             print("Info: data without standard voc format")
+            self.year = 2017
             pass
             # raise ValueError('Cannot infer dataset year from img_prefix')
 
@@ -120,7 +122,7 @@ class DGVOCDataset(VOCDataset):
     def __init__(self, **kwargs):
         super(DGVOCDataset, self).__init__(**kwargs)
 
-        print(len(self.flag), self.CLASSES, "   Info....")
+        #print(len(self.flag), self.CLASSES, "   Info....")
     
     def load_annotations(self, ann_file):
         """Load annotation from XML style ann_file.
@@ -157,9 +159,16 @@ class DGVOCDataset(VOCDataset):
                 #     height = int(size.find('height').text)
 
                 #NOTE maybe size in xml is not real img size; but it is time consuming
-                img_path_com = osp.join(self.img_prefix, img_path)
-                img = Image.open(img_path_com)
+                try:
+                    img_path_com = osp.join(self.img_prefix, img_path)
+                    img = Image.open(img_path_com)
+                except FileNotFoundError:
+                    img_path_com = osp.join(rootpath, img_path)
+                    img = Image.open(img_path_com)
                 width, height = img.size
+                # because subsequent function get xml_path through osp.join(self.img_prefix, xml_name), miss year
+                img_path = osp.join(year, img_path)
+                xml_path = osp.join(year, xml_path)
                 data_infos.append(
                 dict(id=img_id, filename=img_path, xmlname=xml_path, width=width, height=height))
         print(f'read data lenght: {len(data_infos)} in DGVOCDataset')
@@ -227,7 +236,9 @@ class DGVOCDataset(VOCDataset):
         bboxes_ignore = []
         labels_ignore = []
         for obj in root.findall('object'):
-            name = obj.find('name').text
+            name = obj.find('name').text.lower().strip()
+            # #NOTE special for task. has been moved to "class DGVOCDatasetTrainDms"
+            # name = name.replace('fjs_', '')
             if name not in self.CLASSES:
                 continue
             label = self.cat2label[name]
@@ -254,6 +265,317 @@ class DGVOCDataset(VOCDataset):
                 if w < self.min_size or h < self.min_size:
                     ignore = True
             if difficult or ignore:
+                bboxes_ignore.append(bbox)
+                labels_ignore.append(label)
+            else:
+                bboxes.append(bbox)
+                labels.append(label)
+        if not bboxes:
+            bboxes = np.zeros((0, 4))
+            labels = np.zeros((0, ))
+        else:
+            bboxes = np.array(bboxes, ndmin=2) - 1
+            labels = np.array(labels)
+        if not bboxes_ignore:
+            bboxes_ignore = np.zeros((0, 4))
+            labels_ignore = np.zeros((0, ))
+        else:
+            bboxes_ignore = np.array(bboxes_ignore, ndmin=2) - 1
+            labels_ignore = np.array(labels_ignore)
+        ann = dict(
+            bboxes=bboxes.astype(np.float32),
+            labels=labels.astype(np.int64),
+            bboxes_ignore=bboxes_ignore.astype(np.float32),
+            labels_ignore=labels_ignore.astype(np.int64))
+        
+        return ann
+
+    def get_cat_ids(self, idx):
+        """Get category ids in XML file by index.
+
+        Args:
+            idx (int): Index of data.
+
+        Returns:
+            list[int]: All categories in the image of specified index.
+        """
+
+        cat_ids = []
+        #img_id = self.data_infos[idx]['id']
+        xml_name = self.data_infos[idx]['xmlname']
+        xml_path = osp.join(self.img_prefix, xml_name)
+        #xml_path = osp.join(self.img_prefix, 'Annotations', f'{img_id}.xml')
+
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        for obj in root.findall('object'):
+            name = obj.find('name').text
+            if name not in self.CLASSES:
+                continue
+            label = self.cat2label[name]
+            cat_ids.append(label)
+
+        return cat_ids
+
+
+@DATASETS.register_module()
+class DGVOCDatasetTrainDms(DGVOCDataset):
+    def get_ann_info(self, idx):
+        """Get annotation from XML file by index.
+
+        Args:
+            idx (int): Index of data.
+
+        Returns:
+            dict: Annotation info of specified index.
+        """
+
+        xml_name = self.data_infos[idx]['xmlname']
+
+        if xml_name is None:
+            ann = dict(
+            bboxes = np.zeros((0, 4)).astype(np.float32),
+            labels= np.zeros((0, )).astype(np.int64),
+            bboxes_ignore=np.zeros((0, 4)).astype(np.float32),
+            labels_ignore=np.zeros((0, )).astype(np.int64))
+            return ann
+
+        xml_path = osp.join(self.img_prefix, xml_name)
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        bboxes = []
+        labels = []
+        bboxes_ignore = []
+        labels_ignore = []
+        for obj in root.findall('object'):
+            name = obj.find('name').text.lower().strip()
+            #TODO special for task
+            name = name.replace('fjs_', '')
+            if name not in self.CLASSES:
+                continue
+            label = self.cat2label[name]
+            difficult = obj.find('difficult')
+            difficult = 0 if difficult is None else int(difficult.text)
+            bnd_box = obj.find('bndbox')
+            # TODO: check whether it is necessary to use int
+            # Coordinates may be float type
+            bbox = [
+                int(float(bnd_box.find('xmin').text)),
+                int(float(bnd_box.find('ymin').text)),
+                int(float(bnd_box.find('xmax').text)),
+                int(float(bnd_box.find('ymax').text))
+            ]
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            #NOTE think box with small edge < 4 is mislabeling 
+            if w * h <= 0 or min(w, h) < 4:
+                continue
+            
+            ignore = False
+            if self.min_size:
+                assert not self.test_mode
+                if w < self.min_size or h < self.min_size:
+                    ignore = True
+            if difficult or ignore:
+                bboxes_ignore.append(bbox)
+                labels_ignore.append(label)
+            else:
+                bboxes.append(bbox)
+                labels.append(label)
+        if not bboxes:
+            bboxes = np.zeros((0, 4))
+            labels = np.zeros((0, ))
+        else:
+            bboxes = np.array(bboxes, ndmin=2) - 1
+            labels = np.array(labels)
+        if not bboxes_ignore:
+            bboxes_ignore = np.zeros((0, 4))
+            labels_ignore = np.zeros((0, ))
+        else:
+            bboxes_ignore = np.array(bboxes_ignore, ndmin=2) - 1
+            labels_ignore = np.array(labels_ignore)
+        ann = dict(
+            bboxes=bboxes.astype(np.float32),
+            labels=labels.astype(np.int64),
+            bboxes_ignore=bboxes_ignore.astype(np.float32),
+            labels_ignore=labels_ignore.astype(np.int64))
+        
+        return ann
+
+
+@DATASETS.register_module()
+class DGVOCDatasetTestDms(DGVOCDataset):
+    def get_ann_info(self, idx):
+        """Get annotation from XML file by index.
+
+        Args:
+            idx (int): Index of data.
+
+        Returns:
+            dict: Annotation info of specified index.
+        """
+
+        xml_name = self.data_infos[idx]['xmlname']
+
+        if xml_name is None:
+            ann = dict(
+            bboxes = np.zeros((0, 4)).astype(np.float32),
+            labels= np.zeros((0, )).astype(np.int64),
+            bboxes_ignore=np.zeros((0, 4)).astype(np.float32),
+            labels_ignore=np.zeros((0, )).astype(np.int64))
+            return ann
+
+        xml_path = osp.join(self.img_prefix, xml_name)
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        bboxes = []
+        labels = []
+        bboxes_ignore = []
+        labels_ignore = []
+        for obj in root.findall('object'):
+            name = obj.find('name').text.lower().strip()
+            #TODO special for task
+            if name not in self.CLASSES or (name.replace('fjs_', '') not in self.CLASSES):
+                continue
+            label = self.cat2label[name] if name in self.CLASSES else -1
+            difficult = obj.find('difficult')
+            difficult = 0 if difficult is None else int(difficult.text)
+            bnd_box = obj.find('bndbox')
+            bbox = [
+                int(float(bnd_box.find('xmin').text)),
+                int(float(bnd_box.find('ymin').text)),
+                int(float(bnd_box.find('xmax').text)),
+                int(float(bnd_box.find('ymax').text))
+            ]
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            #NOTE think box with small edge < 4 is mislabeling 
+            if w * h <= 0 or min(w, h) < 4:
+                continue
+            ignore = False
+            if 'fjs_' in name:
+                ignore = True
+            if difficult or ignore:
+                bboxes_ignore.append(bbox)
+                labels_ignore.append(label)
+            else:
+                bboxes.append(bbox)
+                labels.append(label)
+        # TODO: check whether it is necessary to use int
+        if not bboxes:
+            bboxes = np.zeros((0, 4))
+            labels = np.zeros((0, ))
+        else:
+            bboxes = np.array(bboxes, ndmin=2) - 1
+            labels = np.array(labels)
+        if not bboxes_ignore:
+            bboxes_ignore = np.zeros((0, 4))
+            labels_ignore = np.zeros((0, ))
+        else:
+            bboxes_ignore = np.array(bboxes_ignore, ndmin=2) - 1
+            labels_ignore = np.array(labels_ignore)
+        ann = dict(
+            bboxes=bboxes.astype(np.float32),
+            labels=labels.astype(np.int64),
+            bboxes_ignore=bboxes_ignore.astype(np.float32),
+            labels_ignore=labels_ignore.astype(np.int64))
+            
+        return ann       
+
+
+@DATASETS.register_module()
+class DGVOCDatasetTrainPhoneWallet(DGVOCDataset):
+
+    def load_annotations(self, ann_file):
+        """Load annotation from XML style ann_file.
+
+        Args:
+            ann_file (str): Path of XML file.
+
+        Returns:
+            list[dict]: Annotation info from XML file.
+        """
+        # print(ann_file, "....debug")
+        assert isinstance(ann_file, (list, tuple)), "ann_file must be list or tuple in DGVOCDataset"
+        data_infos = []
+
+        for (year, name) in ann_file:
+            rootpath = osp.join(self.img_prefix, year)
+            for img_id, line in enumerate(open(osp.join(rootpath, name))):
+                if ';' not in line:
+                    split_item = line.strip().split()
+                else:
+                    split_item = line.strip().split(';')
+                if len(split_item) != 2:
+                    img_path = split_item[0]
+                    xml_path = None
+                else:
+                    img_path, xml_path = split_item
+                    if '.xml' != xml_path[-4:]: xml_path = None
+                img_path_com = osp.join(self.img_prefix, img_path)
+                img = Image.open(img_path_com)
+                width, height = img.size
+                # because subsequent function get xml_path through osp.join(self.img_prefix, xml_name), miss year
+                img_path = osp.join(year, img_path)
+                # NOTE add .
+                if xml_path is None: 
+                    continue
+                xml_path = osp.join(year, xml_path)
+                data_infos.append(
+                dict(id=img_id, filename=img_path, xmlname=xml_path, width=width, height=height))
+        print(f'read data lenght: {len(data_infos)} in DGVOCDatasetTrainPhoneWallet')
+        return data_infos
+
+    def get_ann_info(self, idx):
+        """Get annotation from XML file by index.
+
+        Args:
+            idx (int): Index of data.
+
+        Returns:
+            dict: Annotation info of specified index.
+        """
+        xml_name = self.data_infos[idx]['xmlname']
+
+        xml_path = osp.join(self.img_prefix, xml_name)
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        bboxes = []
+        labels = []
+        bboxes_ignore = []
+        labels_ignore = []
+        for obj in root.findall('object'):
+            name = obj.find('name').text.lower().strip()
+            if name not in self.CLASSES:
+                continue
+            label = self.cat2label[name]
+            difficult = obj.find('difficult')
+            difficult = 0 if difficult is None else int(difficult.text)
+            bnd_box = obj.find('bndbox')
+            # TODO: check whether it is necessary to use int
+            # Coordinates may be float type
+            bbox = [
+                int(float(bnd_box.find('xmin').text)),
+                int(float(bnd_box.find('ymin').text)),
+                int(float(bnd_box.find('xmax').text)),
+                int(float(bnd_box.find('ymax').text))
+            ]
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            #NOTE think box with small edge < 4 is mislabeling 
+            if w * h <= 0 or min(w, h) < 4 or  max(w, h) > 360 or max(w, h) < 4:
+                continue
+            
+            ignore = False
+            if self.min_size:
+                assert not self.test_mode
+                if w < self.min_size or h < self.min_size:
+                    ignore = True
+            if difficult or ignore:
+                print("*"*10)
+                print("\ndifficult or ignore:")
+                print("\nxml_path, img_path", xml_path, self.data_infos[idx]['filename'])
+                print("*"*10)
                 bboxes_ignore.append(bbox)
                 labels_ignore.append(label)
             else:

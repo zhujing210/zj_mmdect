@@ -1,3 +1,4 @@
+from numpy import cos
 import torch
 
 from ..builder import BBOX_ASSIGNERS
@@ -122,7 +123,7 @@ class HungarianAssigner(BaseAssigner):
         bboxes = bbox_cxcywh_to_xyxy(bbox_pred) * factor
         iou_cost = self.iou_cost(bboxes, gt_bboxes)
         # weighted sum of above three costs
-        cost = cls_cost + reg_cost + iou_cost
+        cost = cls_cost + reg_cost + iou_cost # [num_bboxes, num_gts]
 
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()

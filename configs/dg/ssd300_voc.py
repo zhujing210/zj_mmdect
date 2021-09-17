@@ -102,19 +102,20 @@ data = dict(
         times=5, 
         dataset=dict(
             type=dataset_type,
-            ann_file=(('', 'train2017_voc_lm.txt'),),
-            img_prefix='/mnt/data/jingwangdata/DmsCatDog/trainset/',
+            ann_file=(('', 'train2017_voc.txt'),),
+            img_prefix='/mnt/data/jingzhudata/coco2017/',
             pipeline=train_pipeline)),
 
     val=dict(
         type=dataset_type,
-        ann_file=(('', 'val2017_voc_lm.txt'),),
-        img_prefix='/mnt/data/jingwangdata/DmsCatDog/trainset/',
+        ann_file=(('', 'val2017_voc.txt'),),
+        #img_prefix='/mnt/data/jingwangdata/DmsCatDog/trainset/',
+        img_prefix='/mnt/data/jingzhudata/coco2017/',
         pipeline=test_pipeline),
     test=dict(
         type=dataset_type,
-        ann_file=(('', 'val2017_voc_lm.txt'),),
-        img_prefix='/mnt/data/jingwangdata/DmsCatDog/trainset/',
+        ann_file=(('', 'val2017_voc.txt'),),
+        img_prefix='/mnt/data/jingzhudata/coco2017/',
         pipeline=test_pipeline)
 )
 
@@ -165,4 +166,4 @@ load_from = None
 resume_from = None
 workflow = [('train', 1)]
 
-
+work_dir = './work_dirs/ssd300_voc_2'

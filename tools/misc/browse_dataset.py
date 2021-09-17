@@ -1,6 +1,7 @@
 import argparse
 import os
 from pathlib import Path
+import random
 
 import mmcv
 from mmcv import Config, DictAction
@@ -67,8 +68,12 @@ def main():
     dataset = build_dataset(cfg.data.train)
 
     progress_bar = mmcv.ProgressBar(len(dataset))
+    indexes = [i for i in range(len(dataset))]
+    random.shuffle(indexes)
 
-    for item in dataset:
+    # for item in dataset:
+    for i in indexes:
+        item = dataset[i]
         filename = os.path.join(args.output_dir,
                                 Path(item['filename']).name
                                 ) if args.output_dir is not None else None
